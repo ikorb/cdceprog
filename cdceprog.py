@@ -1,8 +1,8 @@
 #!/usr/bin/python
 #
-# cdceprog.py: A quick hack to program a CDCE925 on an I2C bus of a Linux system
+# cdceprog.py: A quick hack to program a CDCE913/925 on an I2C bus of a Linux system
 #
-#  Copyright (C) 2015, Ingo Korb <ingo@akana.de>
+#  Copyright (C) 2015-2017, Ingo Korb <ingo@akana.de>
 #  All rights reserved.
 #
 #  Redistribution and use in source and binary forms, with or without
@@ -31,22 +31,29 @@ import smbus
 import sys
 import time
 
-# FIXME: should be a command-line opt
-# FIXME: address and regcount are for CDCE925
-pll_address  = 0x64
-pll_regcount = 0x30 # FIXME: Meh
+class CDCEPLL:
+    def __init__(self, name, address, register_count):
+        self.name           = name
+        self.address        = address
+        self.register_count = register_count
+
+# FIXME: there should be command-line options for this
+cdce913 = CDCEPLL("CDCE 913", 0x65, 0x20)
+cdce925 = CDCEPLL("CDCE 925", 0x64, 0x30)
+
+all_plls = [cdce913, cdce925]
 
 # read data file
 if len(sys.argv) != 2:
-    print "Usage: {} hexfile".format(sys.argv[0])
+    print("Usage: {} hexfile".format(sys.argv[0]))
     exit(2)
 
-pllregs = [None] * pll_regcount
+pllregs = {}
 
 fd = open(sys.argv[1], "r")
 for line in fd:
     if not line.startswith(":"):
-        print "No start character found in {}".format(line)
+        print("No start character found in {}".format(line))
         exit(2)
 
     data = bytearray.fromhex(line.rstrip().lstrip(":"))
@@ -61,41 +68,59 @@ for line in fd:
         # end marker, do nothing
         pass
     else:
-        print "ERROR: Unknown record type {:d} found".format(data[3])
+        print("ERROR: Unknown record type {:d} found".format(data[3]))
 
 fd.close()
+
+# determine PLL type based on highest register used
+current_pll = None
+pll_regcount = max(pllregs.keys()) + 1
+
+for pll in all_plls:
+    if pll.register_count == pll_regcount:
+        current_pll = pll
+
+if current_pll == None:
+    print("ERROR: No PLL type with {} registers known".format(pll_regcount))
+    exit(2)
+
+print("Found data for a {} chip".format(current_pll.name))
 
 # clear EEPROM lock and write bits
 pllregs[1] = pllregs[1] & ~(1 << 5)
 pllregs[6] = pllregs[6] & ~(1 << 0)
+
+# change device address in data to default for the chip
+if (pllregs[1] & 3) != (current_pll.address & 3):
+    print("WARNING: Non-default I2C address in hex file ignored")
+    pllregs[1] = (pllregs[1] & ~3) | (current_pll.address & 3)
 
 # FIXME: Very old Raspis have I2C0 on the GPIO header
 bus = smbus.SMBus(1)
 
 # check if device is present by reading byte 0
 try:
-    res = bus.read_byte_data(pll_address, 0x80)
+    res = bus.read_byte_data(current_pll.address, 0x80)
 except IOError as e:
-    print "I/O error({0}): {1}".format(e.errno, e.strerror)
-    print "(maybe the PLL is not connected?)"
+    print("I/O error({0}): {1}".format(e.errno, e.strerror))
+    print("(maybe the PLL is not connected?)")
     exit(2)
 
 # write PLL settings
-for i in xrange(0x10, pll_regcount):
+for i in xrange(0x10, current_pll.register_count):
     if pllregs[i] != None:
-        bus.write_byte_data(pll_address, 0x80 + i, pllregs[i])
+        bus.write_byte_data(current_pll.address, 0x80 + i, pllregs[i])
 
 # write control register settings
-# FIXME: This could change the device address, causing further accesses to fail
 for i in xrange(0, 0x10):
     if pllregs[i] != None:
-        bus.write_byte_data(pll_address, 0x80 + i, pllregs[i])
+        bus.write_byte_data(current_pll.address, 0x80 + i, pllregs[i])
 
 # initiate EEPROM write
-bus.write_byte_data(pll_address, 0x86, pllregs[6] | 1)
+bus.write_byte_data(current_pll.address, 0x86, pllregs[6] | 1)
 
 # wait until write is finished
-while bus.read_byte_data(pll_address, 0x81) & (1 << 6):
-    print "Waiting until EEPROM write cycle finishes..."
+while bus.read_byte_data(current_pll.address, 0x81) & (1 << 6):
+    print("Waiting until EEPROM write cycle finishes...")
     time.sleep(0.1)
 
